@@ -26,56 +26,97 @@ char getchar_bf() {
 const uintptr_t _gc = (uintptr_t) getchar_bf;
 const uintptr_t _pc = (uintptr_t) putchar;
 
-enum {INST_PROLOGUE = -1, INST_EPILOGUE = -2, INST_DEBUG = -3};
+enum {INST_PROLOGUE = -1, INST_EPILOGUE = -2, INST_DEBUG = -3, INST_NOP = -4};
 
 // emit an instruction
 // pretty ugly
 int emit(int instr, void* code, uintptr_t jmp) {
+    static int last_instr = INST_NOP;
+    static uint8_t add_amt = 0;
+    static int32_t shift_amt = 0;
+    int len = 0;
     uint8_t* code8 = (uint8_t*) code;
     uint16_t* code16 = (uint16_t*) code;
     uint32_t* code32 = (uint32_t*) code;
+    if (instr != last_instr) {
+        if ((last_instr == '+' || last_instr == '-') && !(instr == '+' || instr == '-')) {
+            if (add_amt == 1) {
+                code16[0] = 0x03fe;     // inc byte ptr [rbx]
+                len = 2;
+            } else if (add_amt == -1) {
+                code16[0] = 0x0bfe;     // dec byte ptr [rbx]
+                len = 2;
+            } else if (add_amt != 0) {
+                code16[0] = 0x0380;
+                code8[2] = add_amt;     // add byte ptr [rbx], add_amt
+                len = 3;
+            }
+            add_amt = 0;
+        } else if ((last_instr == '>' || last_instr == '<') && !(instr == '>' || instr == '<')) {
+            if (shift_amt == 1) {
+                code16[0] = 0xff48;     // inc rbx
+                code8[2] = 0xc3;
+                len = 3;
+            } else if (shift_amt == -1) {
+                code16[0] = 0xff48;     // dec rbx
+                code8[2] = 0xcb;
+                len = 3;
+            } else if (shift_amt != 0) {
+                if (shift_amt <= 127 && shift_amt >= -128) {
+                    code16[0] = 0x8348;
+                    code8[2] = 0xc3;
+                    code8[3] = (int8_t) shift_amt;          // add rbx, shift_amt
+                    len = 4;
+                } else {
+                    code16[0] = 0x8148;
+                    code8[2] = 0xc3;
+                    *(int32_t*) &code8[3] = shift_amt;      // add rbx, shift_amt
+                    len = 7;
+                }
+            }
+            shift_amt = 0;
+        }
+    }
+    last_instr = instr;
+    code8 += len;
+    code16 = (uint16_t*) code8;
+    code32 = (uint32_t*) code8;
     if (instr == '+') {
-        code16[0] = 0x03fe;     // inc byte ptr [rbx]
-        return 2;
+        add_amt++;
     } else if (instr == '-') {
-        code16[0] = 0x0bfe;     // dec byte ptr [rbx]
-        return 2;
+        add_amt--;
     } else if (instr == '>') {
-        code16[0] = 0xff48;     // inc rbx
-        code8[2] = 0xc3;
-        return 3;
+        shift_amt++;
     } else if (instr == '<') {
-        code16[0] = 0xff48;     // dec rbx
-        code8[2] = 0xcb;
-        return 3;
+        shift_amt--;
     } else if (instr == '.') {
         // putchar
 #ifdef ARG_RCX
-        memcpy(code, "\x48\x0f\xb6\x0b\x48\xb8", 6);    // movzx rcx, byte ptr [rbx]; mov rax,
+        memcpy(code8, "\x48\x0f\xb6\x0b\x48\xb8", 6);    // movzx rcx, byte ptr [rbx]; mov rax,
 #else
-        memcpy(code, "\x48\x0f\xb6\x3b\x48\xb8", 6);    // movzx rdi, byte ptr [rbx]; mov rax,
+        memcpy(code8, "\x48\x0f\xb6\x3b\x48\xb8", 6);    // movzx rdi, byte ptr [rbx]; mov rax,
 #endif
         memcpy(&code8[6], &_pc, sizeof(_pc));           // _pc;
         memcpy(&code8[6 + sizeof(_pc)], "\xff\xd0", 2); // call rax
-        return 8 + sizeof(_pc);
+        len += 8 + sizeof(_pc);
     } else if (instr == ',') {
         // getchar
         code16[0] = 0xb848;                             // mov rax,
         memcpy(&code8[2], &_gc, sizeof(_gc));           // _gc;
         memcpy(&code8[2 + sizeof(_gc)], "\xff\xd0", 2); // call rax;
         memcpy(&code8[4 + sizeof(_gc)], "\x88\x03", 2); // mov byte ptr [rbx], al
-        return 6 + sizeof(_gc);
+        len += 6 + sizeof(_gc);
     } else if (instr == '[') {
         code32[0] = 0x0f003b80; // cmp byte ptr [rbx], 0; je
         code8[4] = 0x84;        // je
-        *(int32_t*) (code8 + 5) = -9;
-        return 9;
+        *(int32_t*) &code8[5] = -9;
+        len += 9;
     } else if (instr == ']') {
         code32[0] = 0x0f003b80; // cmp byte ptr [rbx], 0; jne
         code8[4] = 0x85;        // jne
         int32_t offset = (int32_t) (jmp - ((uintptr_t) code8 + 9));
         *(int32_t*) (code8 + 5) = offset;
-        return 9;
+        len += 9;
     } else if (instr == INST_PROLOGUE) {
 #ifdef ARG_RCX
         code32[0] = 0xcb894853; // push rbx; mov rbx, rcx
@@ -84,16 +125,16 @@ int emit(int instr, void* code, uintptr_t jmp) {
 #endif
         // shadow space only needed for windows, but doesn't hurt to always include
         code32[1] = 0x20ec8348; // sub rsp, 32
-        return 8;
+        len += 8;
     } else if (instr == INST_EPILOGUE) {
         code32[0] = 0x20c48348; // add rsp, 32
         code16[2] = 0xc35b;     // pop rbx; ret
-        return 6;
+        len += 6;
     } else if (instr == INST_DEBUG) {
         code8[0] = 0xcc;        // int3
-        return 1;
+        len += 1;
     }
-    return 0;
+    return len;
 }
 
 int main(int argc, char* argv[]) {
@@ -129,7 +170,7 @@ int main(int argc, char* argv[]) {
             }
         } else if (ch == ']') {
             if (depth == 0) {
-                fprintf(stderr, "err: closing bracket with no opening bracket at line %zu col %zu\n", line, col);
+                fprintf(stderr, "error: closing bracket with no opening bracket at line %zu col %zu\n", line, col);
                 return 1;
             }
             depth--;
@@ -147,13 +188,14 @@ int main(int argc, char* argv[]) {
     }
     fclose(f);
     if (depth != 0) {
-        fprintf(stderr, "err: opening bracket with no closing bracket (need %zu at end)\n", depth);
+        fprintf(stderr, "error: opening bracket with no closing bracket (need %zu at end)\n", depth);
+        return 1;
     }
     const size_t CODE_SIZE = 14 + length * 16;
     uintptr_t jmp[maxDepth];
     uint8_t* code = (uint8_t*) mmap(NULL, CODE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code == MAP_FAILED) {
-        fprintf(stderr, "mmap failed\n");
+        fprintf(stderr, "error: mmap failed\n");
         return 1;
     }
     memset(code, 0xcc, CODE_SIZE);
@@ -178,7 +220,8 @@ int main(int argc, char* argv[]) {
     // TODO: tape bounds checking/custom sizes
     void* data = calloc(30000, 1);
     if (!data) {
-        fprintf(stderr, "tape allocation failed\n");
+        fprintf(stderr, "error: tape allocation failed\n");
+        return 1;
     }
     ((void (*)(void*)) code)(data);
     fflush(stdout);

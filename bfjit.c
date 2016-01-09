@@ -6,11 +6,9 @@
 // ...and there's two of them
 #ifdef __CYGWIN__
 // first arg in rcx (microsoft whyyyy)
-#define ARG1 "\x0b"
-#else
-// rdi
-#define ARG1 "\x3b"
+#define ARG_RCX
 #endif
+// otherwise, first arg in rdi
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,14 +23,14 @@ char getchar_bf() {
     else return c;
 }
 
-const size_t CODE_SIZE = 65536;
-const size_t LOOP_NEST = 100;
-const uint64_t _gc = (uint64_t) getchar_bf;
-const uint64_t _pc = (uint64_t) putchar;
+const uintptr_t _gc = (uintptr_t) getchar_bf;
+const uintptr_t _pc = (uintptr_t) putchar;
+
+enum {INST_PROLOGUE = -1, INST_EPILOGUE = -2, INST_DEBUG = -3};
 
 // emit an instruction
 // pretty ugly
-int emit(int instr, void* code, uint64_t jmp) {
+int emit(int instr, void* code, uintptr_t jmp) {
     uint8_t* code8 = (uint8_t*) code;
     uint16_t* code16 = (uint16_t*) code;
     uint32_t* code32 = (uint32_t*) code;
@@ -52,7 +50,11 @@ int emit(int instr, void* code, uint64_t jmp) {
         return 3;
     } else if (instr == '.') {
         // putchar
-        memcpy(code, "\x48\x0f\xb6" ARG1 "\x48\xb8", 6);    // movzx rcx, [rbx]; mov rax,
+#ifdef ARG_RCX
+        memcpy(code, "\x48\x0f\xb6\x0b\x48\xb8", 6);    // movzx rcx, byte ptr [rbx]; mov rax,
+#else
+        memcpy(code, "\x48\x0f\xb6\x3b\x48\xb8", 6);    // movzx rdi, byte ptr [rbx]; mov rax,
+#endif
         memcpy(&code8[6], &_pc, sizeof(_pc));           // _pc;
         memcpy(&code8[6 + sizeof(_pc)], "\xff\xd0", 2); // call rax
         return 8 + sizeof(_pc);
@@ -71,12 +73,11 @@ int emit(int instr, void* code, uint64_t jmp) {
     } else if (instr == ']') {
         code32[0] = 0x0f003b80; // cmp byte ptr [rbx], 0; jne
         code8[4] = 0x85;        // jne
-        int32_t offset = (int32_t) (jmp - ((uint64_t) code8 + 9));
+        int32_t offset = (int32_t) (jmp - ((uintptr_t) code8 + 9));
         *(int32_t*) (code8 + 5) = offset;
         return 9;
-    } else if (instr == -1) {
-        // prologue
-#ifdef __CYGWIN__
+    } else if (instr == INST_PROLOGUE) {
+#ifdef ARG_RCX
         code32[0] = 0xcb894853; // push rbx; mov rbx, rcx
 #else
         code32[0] = 0xfb894853; // push rbx; mov rbx, rdi
@@ -84,13 +85,11 @@ int emit(int instr, void* code, uint64_t jmp) {
         // shadow space only needed for windows, but doesn't hurt to always include
         code32[1] = 0x20ec8348; // sub rsp, 32
         return 8;
-    } else if (instr == -2) {
-        // epilogue
+    } else if (instr == INST_EPILOGUE) {
         code32[0] = 0x20c48348; // add rsp, 32
         code16[2] = 0xc35b;     // pop rbx; ret
         return 6;
-    } else if (instr == -3) {
-        // debug instruction
+    } else if (instr == INST_DEBUG) {
         code8[0] = 0xcc;        // int3
         return 1;
     }
@@ -102,50 +101,85 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "usage: %s file\n", argv[0]);
         return 1;
     }
-    // TODO: make size dynamic
-    unsigned char* code = (unsigned char*) mmap(NULL, CODE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    memset(code, 0xcc, CODE_SIZE);
-    unsigned char* p = code;
-    // TODO: make this dynamically allocated
-    uint64_t jmp[LOOP_NEST];
-    size_t i = 0;
-    p += emit(-1, p, 0);
     FILE* f = fopen(argv[1], "r");
     if (!f) {
         fprintf(stderr, "error: could not open file %s\n", argv[1]);
         return 1;
     }
     int c;
-    while ((c = fgetc(f)) != EOF) {
-        if (c == ']') {
-            if (i == 0) {
-                fprintf(stderr, "error: ']' without matching '['\n");
-                return 1;
-            } else {
-                i--;
-            }
-        }
-        p += emit((unsigned char) c, p, jmp[i]);
-        if (c == '[') {
-            if (i >= LOOP_NEST) {
-                fprintf(stderr, "error: too many nested loops\n");
-                return 1;
-            }
-            jmp[i++] = (uint64_t) p;
-        } else if (c == ']') {
-            int32_t offset = (int32_t) ((uint64_t) p - jmp[i]);
-            *(int32_t*) (jmp[i] - 4) = offset;
-        }
-    }
-    fclose(f);
-    if (i != 0) {
-        fprintf(stderr, "error: '[' without matching ']'\n");
+    size_t i, length = 0, maxLength = 1024, depth = 0, maxDepth = 1, line = 1, col = 0;
+    char* text = malloc(maxLength * sizeof(char));
+    if (!text) {
+        fprintf(stderr, "error: read buffer allocation failed\n");
         return 1;
     }
-    p += emit(-2, p, 0);
+    while ((c = fgetc(f)) != EOF) {
+        char ch = (char) c;
+        if (ch == '\n') {
+            line++;
+            col = 0;
+        }
+        col++;
+        if (ch != '+' && ch != '-' && ch != '<' && ch != '>' && ch != '[' && ch != ']' && ch != '.' && ch != ',')
+            continue;
+        if (ch == '[') {
+            depth++;
+            if (depth > maxDepth) {
+                maxDepth = depth;
+            }
+        } else if (ch == ']') {
+            if (depth == 0) {
+                fprintf(stderr, "err: closing bracket with no opening bracket at line %zu col %zu\n", line, col);
+                return 1;
+            }
+            depth--;
+        }
+        length++;
+        if (length > maxLength) {
+            maxLength *= 2;
+            text = realloc(text, maxLength * sizeof(char));
+            if (!text) {
+                fprintf(stderr, "error: read buffer allocation failed\n");
+                return 1;
+            }
+        }
+        text[length - 1] = ch;
+    }
+    fclose(f);
+    if (depth != 0) {
+        fprintf(stderr, "err: opening bracket with no closing bracket (need %zu at end)\n", depth);
+    }
+    const size_t CODE_SIZE = 14 + length * 16;
+    uintptr_t jmp[maxDepth];
+    uint8_t* code = (uint8_t*) mmap(NULL, CODE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) {
+        fprintf(stderr, "mmap failed\n");
+        return 1;
+    }
+    memset(code, 0xcc, CODE_SIZE);
+    uint8_t* p = code;
+    p += emit(INST_PROLOGUE, p, 0);
+    for (i = 0; i < length; i++) {
+        char ch = text[i];
+        if (ch == ']') {
+            depth--;
+        }
+        p += emit((unsigned char) ch, p, jmp[depth]);
+        if (ch == '[') {
+            jmp[depth++] = (uintptr_t) p;
+        } else if (ch == ']') {
+            int32_t offset = (int32_t) ((uintptr_t) p - jmp[depth]);
+            *(int32_t*) (jmp[depth] - 4) = offset;
+        }
+    }
+    p += emit(INST_EPILOGUE, p, 0);
+    free(text);
     mprotect(code, CODE_SIZE, PROT_READ | PROT_EXEC);
-    // TODO: bounds checking/custom tape sizes
+    // TODO: tape bounds checking/custom sizes
     void* data = calloc(30000, 1);
+    if (!data) {
+        fprintf(stderr, "tape allocation failed\n");
+    }
     ((void (*)(void*)) code)(data);
     fflush(stdout);
     munmap(code, CODE_SIZE);

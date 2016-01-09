@@ -212,7 +212,6 @@ int main(int argc, char* argv[]) {
             depth--;
         }
         if (i < length - 2 && ch == '[' && text[i + 2] == ']' && (text[i + 1] == '+' || text[i + 1] == '-')) {
-            fprintf(stderr, "found zero\n");
             inst = INST_ZERO;
             ch = 0; // don't want loop processing
             i += 2;

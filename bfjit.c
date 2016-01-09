@@ -26,7 +26,7 @@ char getchar_bf() {
 const uintptr_t _gc = (uintptr_t) getchar_bf;
 const uintptr_t _pc = (uintptr_t) putchar;
 
-enum {INST_PROLOGUE = -1, INST_EPILOGUE = -2, INST_DEBUG = -3, INST_NOP = -4};
+enum {INST_PROLOGUE = -1, INST_EPILOGUE = -2, INST_DEBUG = -3, INST_NOP = -4, INST_ZERO = -5};
 
 // emit an instruction
 // pretty ugly
@@ -133,6 +133,10 @@ int emit(int instr, void* code, uintptr_t jmp) {
     } else if (instr == INST_DEBUG) {
         code8[0] = 0xcc;        // int3
         len += 1;
+    } else if (instr == INST_ZERO) {
+        code16[0] = 0x03c6;
+        code8[2] = 0x00;
+        len += 3;
     }
     return len;
 }
@@ -203,10 +207,17 @@ int main(int argc, char* argv[]) {
     p += emit(INST_PROLOGUE, p, 0);
     for (i = 0; i < length; i++) {
         char ch = text[i];
+        int inst = (unsigned char) ch;
         if (ch == ']') {
             depth--;
         }
-        p += emit((unsigned char) ch, p, jmp[depth]);
+        if (i < length - 2 && ch == '[' && text[i + 2] == ']' && (text[i + 1] == '+' || text[i + 1] == '-')) {
+            fprintf(stderr, "found zero\n");
+            inst = INST_ZERO;
+            ch = 0; // don't want loop processing
+            i += 2;
+        }
+        p += emit(inst, p, jmp[depth]);
         if (ch == '[') {
             jmp[depth++] = (uintptr_t) p;
         } else if (ch == ']') {
